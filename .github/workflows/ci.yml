@@ -1,0 +1,113 @@
+# CI for a znectAI project. Pipeline agents can never change this file (the GitHub App has no
+# workflows permission), so it is written once to last: each step skips itself until the code it
+# checks exists — specs only at first, then the Python backend, then the web app.
+# The job names are the required checks that scripts/protect_main.sh sets: lint, test, secrets,
+# audit. Keep znectai.yml's checks in step with these.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          pip install pyyaml jsonschema ruff
+      - name: Specs (spec_check)
+        run: python -m tools.spec_check
+      - name: Python lint
+        run: |
+          if [ -f pyproject.toml ]; then ruff check . && ruff format --check .
+          else echo "no Python code yet"; fi
+      - name: Layering (import-linter)
+        run: |
+          if [ -f .importlinter ]; then lint-imports
+          else echo "no layering contracts yet"; fi
+      - name: Web lint and types
+        if: hashFiles('web/package.json') != ''
+        working-directory: web
+        run: |
+          npm ci
+          npm run lint --if-present
+          npx tsc --noEmit
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # A throwaway database for the tests: trust authentication, so no password exists to leak
+          # (and nothing for the secrets scan to flag).
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: app_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 15
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://postgres@localhost:5432/app_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Backend tests
+        run: |
+          if [ -d tests ]; then
+            if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+            pytest -q
+          else echo "no tests yet"; fi
+      - name: Web tests
+        if: hashFiles('web/package.json') != ''
+        working-directory: web
+        run: |
+          npm ci
+          npx vitest run
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Scan for committed secrets
+        run: |
+          pip install -q detect-secrets
+          detect-secrets scan --all-files --exclude-files '(^|/)(node_modules|\.git)/' > /tmp/scan.json
+          python - <<'PY'
+          import json, sys
+          found = json.load(open("/tmp/scan.json"))["results"]
+          for path, hits in found.items():
+              for h in hits:
+                  print(f"{path}:{h['line_number']}: possible {h['type']}")
+          sys.exit(1 if found else 0)
+          PY
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Python dependencies
+        run: |
+          if [ -f requirements.txt ]; then pip install -q pip-audit && pip-audit -r requirements.txt
+          else echo "no Python dependencies yet"; fi
+      - name: Web dependencies
+        if: hashFiles('web/package-lock.json') != ''
+        working-directory: web
+        run: npm audit --audit-level=high

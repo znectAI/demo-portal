@@ -1,0 +1,21 @@
+# Read by the znectAI worker from main. No agent can change this file; change it here, by hand.
+# Keep `checks` in step with .github/workflows/ci.yml. Each step skips itself until the code it
+# checks exists, so the same file works from the first requirements to the finished system.
+
+setup:
+  - "[ ! -f requirements-dev.txt ] || pip install --user -q -r requirements-dev.txt"
+  - pip install --user -q pyyaml jsonschema ruff
+
+checks:
+  - python -m tools.spec_check --quiet
+  - "[ ! -f pyproject.toml ] || ruff check ."
+  - "[ ! -f pyproject.toml ] || ruff format --check ."
+  - "[ ! -f .importlinter ] || lint-imports"
+  - "[ ! -d tests ] || pytest -q"
+
+env:
+  TEST_DATABASE_URL: postgresql+psycopg://postgres@localhost:5432/app_test
+
+services:
+  postgres:
+    databases: [app_test]
