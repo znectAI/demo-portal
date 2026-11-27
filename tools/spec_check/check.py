@@ -27,6 +27,9 @@ stage is checked as far as it goes:
                  unique. With nothing else yet, that is all there is to check.
   use cases      the use-case checks above; until the design exists (architecture/overview.md
                  or model/canonical.yaml), the model and persistence aren't required yet.
+                 With requirements: every use case names the requirements it covers
+                 ("Requirements: R-USE-1, ..."), every id cited exists, and specs/coverage.md
+                 accounts for every requirement (see check_coverage).
   design         everything.
 """
 
@@ -549,6 +552,123 @@ def check_requirements(root: Path, report: Report) -> set[str]:
     return set(ids)
 
 
+# ---------------------------------------------------------------- coverage
+
+UC_REQS = re.compile(r"^Requirements:\s*(.+)$", re.MULTILINE)
+REQ_ID = re.compile(r"\bR-[A-Z]+-\d+\b")
+AC_FROM = re.compile(r"(?:←|<-)\s*(R-AC-\d+(?:\s*,\s*R-AC-\d+)*)")
+COVERAGE = "specs/coverage.md"
+# Where each kind of requirement must end up. Prefixes are the requirement document's sections.
+CONTEXT = {"GOAL", "HEAD", "SCOPE", "PEOPLE", "IDEA"}  # background: listed, not traced
+IN_USE_CASES = {"ROLE", "USE", "RULE", "AC"}  # must reach a use case
+IN_DESIGN = {"DATA", "INT", "SRC", "NFR", "SEC", "CON", "TEST"}  # the design's (gate 2)
+NOT_TRACED = ("out of scope", "superseded")  # allowed for any item, with a reason
+
+
+def assumption_ids(text: str) -> set[str]:
+    """Ids listed under the requirements' "## Assumptions": guesses nobody confirmed one by one."""
+    _, _, rest = text.partition("\n## Assumptions")
+    section = rest.split("\n## ", 1)[0]
+    return set(REQ_ID.findall(section))
+
+
+def check_coverage(root: Path, req_ids: set[str], report: Report) -> None:
+    """Use cases against the signed-off requirements.
+
+    Each use case cites its requirements on a line "Requirements: R-USE-1, R-RULE-3" under its
+    title, and a criterion refined from a requirement's acceptance criterion ends "← R-AC-4".
+    A use case that rests on an assumption (the requirements' Assumptions list) lists it under
+    "## Assumptions", so reviewers see the guess where it lands.
+
+    specs/coverage.md has one table row per requirement: | R-USE-1 | UC-001 | note |. "Where" is
+    use cases (UC-nnn, comma separated), "design" (the design's, gate 2), "context" (background),
+    or "out of scope" / "superseded" with a reason in the note."""
+    req_text = (root / "specs/requirements/requirements.md").read_text()
+    guesses = assumption_ids(req_text)
+    cited: dict[str, set[str]] = {}  # requirement id -> use cases that cite it
+    ac_sources: set[str] = set()
+    ucs: set[str] = set()
+    for path in sorted((root / "specs/use-cases").glob("UC-*.md")):
+        m = re.match(r"(UC-\d{3})-", path.name)
+        if not m:
+            continue  # reported by check_use_cases
+        uc, name, text = m.group(1), rel(path, root), path.read_text()
+        ucs.add(uc)
+        line = UC_REQS.search(text)
+        mine = set(REQ_ID.findall(line.group(1))) if line else set()
+        if not mine:
+            report.error(f"{name}: no 'Requirements: R-...' line naming the requirements it covers")
+        for i in sorted(set(REQ_ID.findall(text)) - req_ids):
+            report.error(f"{name}: cites {i}, which requirements.md doesn't define")
+        for line_text in text.splitlines():
+            found = AC_FROM.search(line_text)
+            if found:
+                if not AC_DEF.search(line_text):
+                    report.error(f"{name}: '← {found.group(1)}' is not on an acceptance criterion line")
+                ac_sources.update(REQ_ID.findall(found.group(1)))
+        for i in sorted(set(REQ_ID.findall(text)) & req_ids):
+            cited.setdefault(i, set()).add(uc)
+        _, _, after = text.partition("\n## Assumptions")
+        flagged = set(REQ_ID.findall(after.split("\n## ", 1)[0])) if after else set()
+        for i in sorted((set(REQ_ID.findall(text)) & guesses) - flagged):
+            report.error(f"{name}: rests on {i}, an assumption nobody confirmed; list it under '## Assumptions'")
+
+    path = root / COVERAGE
+    if not path.exists():
+        report.error(f"{COVERAGE} is missing: it accounts for every requirement")
+        return
+    rows: dict[str, tuple[str, str]] = {}
+    for raw in path.read_text().splitlines():
+        cells = [c.strip() for c in raw.strip().strip("|").split("|")] if raw.lstrip().startswith("|") else []
+        if len(cells) < 2 or not re.fullmatch(r"R-[A-Za-z]+-\S*", cells[0]):
+            continue
+        rid, where, note = cells[0], cells[1], cells[2] if len(cells) > 2 else ""
+        if rid not in req_ids:
+            report.error(f"{COVERAGE}: {rid} isn't a requirement in requirements.md")
+        elif rid in rows:
+            report.error(f"{COVERAGE}: {rid} has more than one row")
+        else:
+            rows[rid] = (where, note)
+    for rid in sorted(req_ids - set(rows), key=_req_order):
+        report.error(f"{COVERAGE}: {rid} is not accounted for")
+    for rid, (where, note) in sorted(rows.items(), key=lambda r: _req_order(r[0])):
+        kind = rid.split("-")[1]
+        low = where.lower()
+        targets = set(re.findall(r"\bUC-\d{3}\b", where))
+        if low in NOT_TRACED:
+            if not note:
+                report.error(f"{COVERAGE}: {rid} is {low}: say why in the note")
+            continue
+        if targets:
+            for uc in sorted(targets - ucs):
+                report.error(f"{COVERAGE}: {rid} goes to {uc}, which doesn't exist")
+            for uc in sorted((targets & ucs) - cited.get(rid, set())):
+                report.error(f"{COVERAGE}: {rid} goes to {uc}, but {uc} doesn't cite it")
+            if kind == "AC" and rid not in ac_sources:
+                report.error(f"{COVERAGE}: {rid} is an acceptance criterion: a criterion must end '← {rid}'")
+            continue
+        if low == "context" and kind in CONTEXT:
+            continue
+        if low == "design" and kind in IN_DESIGN:
+            continue
+        need = (
+            "a use case (UC-nnn)" if kind in IN_USE_CASES
+            else "'design'" if kind in IN_DESIGN
+            else "'context'" if kind in CONTEXT
+            else "a use case, 'design' or 'context'"
+        )
+        report.error(f"{COVERAGE}: {rid} goes to {where or '(nothing)'}; it needs {need}, or "
+                     "'out of scope' / 'superseded' with a reason")
+    traced = sum(1 for r in rows if re.search(r"\bUC-\d{3}\b", rows[r][0]))
+    report.notes.append(f"coverage: {len(rows)} of {len(req_ids)} requirements accounted for, "
+                        f"{traced} traced to use cases")
+
+
+def _req_order(rid: str) -> tuple[str, int]:
+    kind, _, n = rid[2:].rpartition("-")
+    return kind, int(n) if n.isdigit() else 0
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -557,7 +677,7 @@ def run(root: Path, strict: bool = False) -> Report:
     if not (root / "specs" / "constitution.md").exists():
         report.error("no specs/constitution.md: not a spec-driven repo")
         return report
-    check_requirements(root, report)
+    req_ids = check_requirements(root, report)
     arch = root / "specs/architecture"
     has_design = (arch / "overview.md").exists() or (arch / "model/canonical.yaml").exists()
     has_use_cases = any((root / "specs/use-cases").glob("UC-*.md"))
@@ -579,6 +699,8 @@ def run(root: Path, strict: bool = False) -> Report:
     if not patterns:
         report.error("specs/architecture/patterns.md defines no patterns (## P1 ...)")
     criteria = check_use_cases(root, invariant_ids(model) | nfr_ids(root), patterns, report)
+    if req_ids and has_use_cases:
+        check_coverage(root, req_ids, report)
     examples = check_consumers(root, report)
     known = (
         {i for ids in criteria.values() for i in ids}
